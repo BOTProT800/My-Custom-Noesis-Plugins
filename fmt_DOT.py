@@ -1,13 +1,13 @@
 # Dawn of Titans - Echo BOF format 1.0 (NaturalMotion / Echo engine)
-# Opens decompressed skeletal meshes.
+# Opens decompressed skeletal meshes with UVs and textures.
 #
 # Install: copy to Noesis/plugins/python/ (overwrite older copy), restart Noesis.
-# Open: files in the dotmesh/ folder (*.dotmesh), or decompressed *.atc BOF payloads.
-#
-# Vertex stride is NOT fixed (seen: 31, 39, 43). It is auto-detected per file.
+# Open: *.dotmesh with TD_/TN_ PNGs in the same folder (Anansi mesh export).
+# UV view in Noesis: press U.
 
 from inc_noesis import *
 
+import math
 import noesis
 import rapi
 import struct
@@ -30,10 +30,13 @@ DOT_PARENTS = {
 
 
 def registerNoesisTypes():
-    for ext in (".dotmesh", ".atc"):
-        handle = noesis.register("Dawn of Titans Echo BOF", ext)
-        noesis.setHandlerTypeCheck(handle, noepyCheckType)
-        noesis.setHandlerLoadModel(handle, noepyLoadModel)
+    handle = noesis.register("Dawn of Titans Echo BOF", ".dotmesh")
+    noesis.setHandlerTypeCheck(handle, noepyCheckType)
+    noesis.setHandlerLoadModel(handle, noepyLoadModel)
+
+    handle_atc = noesis.register("Dawn of Titans Echo BOF", ".atc")
+    noesis.setHandlerTypeCheck(handle_atc, noepyCheckType)
+    noesis.setHandlerLoadModel(handle_atc, noepyLoadModel)
     return 1
 
 
@@ -356,14 +359,777 @@ def guess_parent(name, name_set, sk_root):
     return sk_root
 
 
-def decode_packed_normal(packed):
-    x = (packed & 0x3FF) / 1023.0 * 2.0 - 1.0
-    y = ((packed >> 10) & 0x3FF) / 1023.0 * 2.0 - 1.0
-    z = ((packed >> 20) & 0x3FF) / 1023.0 * 2.0 - 1.0
-    length = (x * x + y * y + z * z) ** 0.5
-    if length > 1e-6:
-        return x / length, y / length, z / length
-    return 0.0, 1.0, 0.0
+def split_dot_bone_name(name):
+    """Split SK_Root, HIPS_A_MID, UPPERLEG_A_RT, WEAPON_SP, etc."""
+    up = name.upper()
+    if up.startswith("SK_"):
+        return up, None
+    if up == "WEAPON_SP":
+        return "WEAPON", "SP"
+    for side in ("RT", "LF", "MID"):
+        suf = "_A_" + side
+        if up.endswith(suf):
+            return up[: -len(suf)], side
+    return up, None
+
+
+# Parent base name -> parent base name (Echo _A_RT/_A_LF/_A_MID rigs).
+DOT_A_PARENT = {
+    "ROOT": "SK_ROOT",
+    "HIPS": "ROOT",
+    "SPINE_1": "HIPS",
+    "SPINE_2": "SPINE_1",
+    "NECK": "SPINE_2",
+    "HEAD": "NECK",
+    "CLAVICLE": "SPINE_2",
+    "UPPERARM": "CLAVICLE",
+    "LOWERARM": "UPPERARM",
+    "HAND": "LOWERARM",
+    "ARMTWISTER": "LOWERARM",
+    "WEAPON": "HAND",
+    "UPPERLEG": "HIPS",
+    "LOWERLEG": "UPPERLEG",
+    "ANKLE": "LOWERLEG",
+    "GDE_FOOTHEEL": "ANKLE",
+    "BALL": "GDE_FOOTHEEL",
+    "TOE": "BALL",
+    "CLOTH_1": "SPINE_2",
+    "CLOTH_2": "CLOTH_1",
+}
+
+
+def resolve_dot_bone_name(base, side, names, sk_root):
+    """Find the actual joint name for a base + side in the file."""
+    if base == "SK_ROOT":
+        return sk_root
+    if side:
+        cand = base + "_A_" + side
+        if cand in names:
+            return cand
+    cand = base + "_A_MID"
+    if cand in names:
+        return cand
+    for n in names:
+        if n.upper().startswith(base + "_"):
+            return n
+    return None
+
+
+def guess_parent_dot_a(name, names, sk_root):
+    if name == sk_root:
+        return None
+
+    base, side = split_dot_bone_name(name)
+    if base == "SK_" + sk_root.split("_", 1)[-1] if sk_root and "_" in sk_root else "":
+        return None
+    if sk_root and base == sk_root.upper().replace("SK_", "", 1):
+        return None
+
+    if base == "ROOT" or name.upper().startswith("ROOT_"):
+        return sk_root
+
+    if name.upper() == "WEAPON_SP":
+        for cand in ("HAND_A_RT", "HAND_A_MID"):
+            if cand in names:
+                return cand
+        return sk_root
+
+    parent_base = DOT_A_PARENT.get(base)
+    if not parent_base:
+        return guess_parent(name, set(names), sk_root)
+
+    parent_name = resolve_dot_bone_name(parent_base, side, names, sk_root)
+    if parent_name and parent_name != name:
+        return parent_name
+    return sk_root
+
+
+def _bone_norm_pos(base, side):
+    """Normalized (0-1) position inside the mesh bounds per joint type."""
+    table = {
+        "SK_ROOT": (0.50, 0.46, 0.50),
+        "ROOT": (0.50, 0.46, 0.50),
+        "HIPS": (0.50, 0.48, 0.50),
+        "SPINE_1": (0.50, 0.56, 0.50),
+        "SPINE_2": (0.50, 0.64, 0.50),
+        "NECK": (0.50, 0.78, 0.50),
+        "HEAD": (0.50, 0.90, 0.50),
+        "CLAVICLE": (0.50, 0.70, 0.50),
+        "UPPERARM": (0.50, 0.66, 0.50),
+        "LOWERARM": (0.50, 0.58, 0.50),
+        "HAND": (0.50, 0.52, 0.50),
+        "ARMTWISTER": (0.50, 0.56, 0.50),
+        "WEAPON": (0.50, 0.50, 0.50),
+        "UPPERLEG": (0.50, 0.40, 0.50),
+        "LOWERLEG": (0.50, 0.24, 0.50),
+        "ANKLE": (0.50, 0.08, 0.50),
+        "GDE_FOOTHEEL": (0.50, 0.04, 0.50),
+        "BALL": (0.50, 0.02, 0.52),
+        "TOE": (0.50, 0.00, 0.55),
+        "CLOTH_1": (0.50, 0.50, 0.45),
+        "CLOTH_2": (0.50, 0.42, 0.42),
+    }
+    nx, ny, nz = table.get(base, (0.50, 0.50, 0.50))
+
+    if side == "RT":
+        if base in ("CLAVICLE", "UPPERARM", "LOWERARM", "HAND", "ARMTWISTER", "WEAPON"):
+            nx = 0.78
+        elif base in ("UPPERLEG", "LOWERLEG", "ANKLE", "GDE_FOOTHEEL", "BALL", "TOE"):
+            nx = 0.62
+        else:
+            nx = 0.58
+    elif side == "LF":
+        if base in ("CLAVICLE", "UPPERARM", "LOWERARM", "HAND", "ARMTWISTER", "WEAPON"):
+            nx = 0.22
+        elif base in ("UPPERLEG", "LOWERLEG", "ANKLE", "GDE_FOOTHEEL", "BALL", "TOE"):
+            nx = 0.38
+        else:
+            nx = 0.42
+    elif side == "SP":
+        nx = 0.82
+
+    return nx, ny, nz
+
+
+def _world_bone_pos(name, names, sk_root, bounds):
+    min_x, max_x, min_y, max_y, min_z, max_z = bounds
+    width = max(max_x - min_x, 0.001)
+    height = max(max_y - min_y, 0.001)
+    depth = max(max_z - min_z, 0.001)
+
+    if name == sk_root:
+        nx, ny, nz = _bone_norm_pos("SK_ROOT", None)
+    else:
+        base, side = split_dot_bone_name(name)
+        if base.startswith("SK_"):
+            nx, ny, nz = _bone_norm_pos("SK_ROOT", None)
+        else:
+            nx, ny, nz = _bone_norm_pos(base, side)
+
+    return (
+        min_x + width * nx,
+        min_y + height * ny,
+        min_z + depth * nz,
+    )
+
+
+def _skeleton_stride(body_size, bone_count):
+    if bone_count <= 0:
+        return None
+    rem = body_size - 8
+    if rem <= 0 or rem % bone_count != 0:
+        return None
+    return rem // bone_count
+
+
+def find_bind_pose_skeleton(data, joint_count):
+    marker = b"SKELETON\x00"
+    pos = 0
+    while True:
+        idx = data.find(marker, pos)
+        if idx < 0:
+            return None
+        if idx + 64 <= len(data):
+            hdr = struct.unpack_from("<8I", data, idx + 32)
+            body_size, bone_count = hdr[0], hdr[1]
+            if bone_count != joint_count:
+                pos = idx + 1
+                continue
+            stride = _skeleton_stride(body_size, bone_count)
+            if stride is None or stride < 84:
+                pos = idx + 1
+                continue
+            body = idx + 32 + 8
+            if body + bone_count * stride > len(data):
+                pos = idx + 1
+                continue
+            return body, stride
+        pos = idx + 1
+
+
+def parse_skeleton_bind_pose(data, joint_names):
+    found = find_bind_pose_skeleton(data, len(joint_names))
+    if found is None:
+        return None
+    body, stride = found
+    poses = []
+    for i in range(len(joint_names)):
+        rec = data[body + i * stride : body + (i + 1) * stride]
+        if len(rec) < 84:
+            return None
+        q = struct.unpack_from("<4f", rec, 56)
+        t = struct.unpack_from("<3f", rec, 72)
+        poses.append((q, t))
+    return poses
+
+
+def quat_trans_to_mat43(qx, qy, qz, qw, tx, ty, tz):
+    # Echo root records often store (0,0,±1,0) — treat as identity for FBX bind.
+    if (
+        abs(qx) < 1e-4
+        and abs(qy) < 1e-4
+        and abs(abs(qz) - 1.0) < 1e-4
+        and abs(qw) < 1e-4
+    ):
+        qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+
+    length = (qx * qx + qy * qy + qz * qz + qw * qw) ** 0.5
+    if length > 1e-8:
+        qx, qy, qz, qw = qx / length, qy / length, qz / length, qw / length
+    else:
+        qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+
+    xx, yy, zz = qx * qx, qy * qy, qz * qz
+    xy, xz, yz = qx * qy, qx * qz, qy * qz
+    wx, wy, wz = qw * qx, qw * qy, qw * qz
+    mat = NoeMat43()
+    mat[0] = NoeVec3((1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz), 2.0 * (xz - wy)))
+    mat[1] = NoeVec3((2.0 * (xy - wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx)))
+    mat[2] = NoeVec3((2.0 * (xz + wy), 2.0 * (yz - wx), 1.0 - 2.0 * (xx + yy)))
+    mat[3] = NoeVec3((tx, ty, tz))
+    return mat
+
+
+def _build_bones_heuristic(names, bounds):
+    sk_root = names[0] if names[0].upper().startswith("SK_") else None
+    name_to_idx = {name: idx for idx, name in enumerate(names)}
+    world = {}
+    for name in names:
+        world[name] = _world_bone_pos(name, names, sk_root, bounds)
+
+    children = {}
+    parents = {}
+    for name in names:
+        parent = guess_parent_dot_a(name, names, sk_root)
+        parents[name] = parent
+        if parent:
+            children.setdefault(parent, []).append(name)
+
+    bones = []
+    for i, name in enumerate(names):
+        parent = parents[name]
+        wx, wy, wz = world[name]
+        mat = NoeMat43()
+        if parent is None:
+            mat[3] = NoeVec3((wx, wy, wz))
+        else:
+            px, py, pz = world[parent]
+            mat[3] = NoeVec3((wx - px, wy - py, wz - pz))
+            child_list = children.get(name)
+            if child_list:
+                child_name = child_list[0]
+                cx, cy, cz = world[child_name]
+                mat = _bone_points_to_child(mat, (wx, wy, wz), (cx, cy, cz))
+                mat[3] = NoeVec3((wx - px, wy - py, wz - pz))
+        parent_idx = name_to_idx[parent] if parent in name_to_idx else -1
+        bones.append(NoeBone(i, name, mat, parent or "", parent_idx))
+    return bones
+
+
+def build_bones(names, bounds, data=None):
+    if not names:
+        return []
+
+    sk_root = names[0] if names[0].upper().startswith("SK_") else None
+    name_to_idx = {name: idx for idx, name in enumerate(names)}
+    poses = parse_skeleton_bind_pose(data, names) if data else None
+    if poses:
+        bones = []
+        for i, name in enumerate(names):
+            (qx, qy, qz, qw), (tx, ty, tz) = poses[i]
+            mat = quat_trans_to_mat43(qx, qy, qz, qw, tx, ty, tz)
+            parent = guess_parent_dot_a(name, names, sk_root)
+            parent_idx = name_to_idx[parent] if parent in name_to_idx else -1
+            bones.append(NoeBone(i, name, mat, parent or "", parent_idx))
+        print("DOT: bind pose SKELETON (%d bones)" % len(bones))
+        return bones
+
+    print("DOT: bind pose heuristic (no SKELETON block)")
+    return _build_bones_heuristic(names, bounds)
+
+
+def _bone_points_to_child(local_mat, parent_world, child_world):
+    """Rotate bone +Y to point at child (common FBX/DCC convention)."""
+    try:
+        dx = child_world[0] - parent_world[0]
+        dy = child_world[1] - parent_world[1]
+        dz = child_world[2] - parent_world[2]
+        length = (dx * dx + dy * dy + dz * dz) ** 0.5
+        if length <= 1e-5:
+            return local_mat
+        dx /= length
+        dy /= length
+        dz /= length
+        # Default bone axis +Y -> direction
+        up = NoeVec3((0.0, 1.0, 0.0))
+        dirv = NoeVec3((dx, dy, dz))
+        cross = NoeVec3((
+            up[1] * dirv[2] - up[2] * dirv[1],
+            up[2] * dirv[0] - up[0] * dirv[2],
+            up[0] * dirv[1] - up[1] * dirv[0],
+        ))
+        dot = up[0] * dirv[0] + up[1] * dirv[1] + up[2] * dirv[2]
+        dot = max(-1.0, min(1.0, dot))
+        if abs(dot - 1.0) < 1e-5:
+            return local_mat
+        if abs(dot + 1.0) < 1e-5:
+            local_mat[0] = NoeVec3((1.0, 0.0, 0.0))
+            local_mat[1] = NoeVec3((0.0, -1.0, 0.0))
+            local_mat[2] = NoeVec3((0.0, 0.0, -1.0))
+            return local_mat
+        angle = math.acos(dot)
+        axis_len = (cross[0] ** 2 + cross[1] ** 2 + cross[2] ** 2) ** 0.5
+        if axis_len <= 1e-8:
+            return local_mat
+        axis = NoeVec3((cross[0] / axis_len, cross[1] / axis_len, cross[2] / axis_len))
+        # Rodrigues rotation matrix
+        c = math.cos(angle)
+        s = math.sin(angle)
+        t = 1.0 - c
+        x, y, z = axis[0], axis[1], axis[2]
+        rot = NoeMat43()
+        rot[0] = NoeVec3((t * x * x + c, t * x * y + s * z, t * x * z - s * y))
+        rot[1] = NoeVec3((t * x * y - s * z, t * y * y + c, t * y * z + s * x))
+        rot[2] = NoeVec3((t * x * z + s * y, t * y * z - s * x, t * z * z + c))
+        rot[3] = local_mat[3]
+        return rot
+    except Exception:
+        return local_mat
+
+
+def read_section_strings(data, section_name, max_strings=256):
+    off = find_section(data, section_name)
+    if off < 0:
+        return []
+    pos = off + 32
+    end = min(len(data), off + 65536)
+    strings = []
+    while pos < end and len(strings) < max_strings:
+        z = data.find(b"\x00", pos, end)
+        if z <= pos:
+            pos += 1
+            continue
+        raw = data[pos:z]
+        pos = z + 1
+        if len(raw) < 2:
+            continue
+        try:
+            text = raw.decode("ascii")
+        except Exception:
+            continue
+        if text.startswith("NAME-") and text != section_name:
+            break
+        if text.isprintable():
+            strings.append(text)
+    return strings
+
+
+def parse_texture_names(data):
+    names = read_section_strings(data, "NAME-TEXTURES")
+    if names:
+        return names
+    return parse_texture_dependencies(data)
+
+
+def parse_texture_dependencies(data):
+    """TD_/TN_/TL_/TS_ texture names referenced by the BOF."""
+    names = read_section_strings(data, "NAME-TEXTURES")
+    if names:
+        return names
+
+    seen = set()
+    deps = []
+    pos = 0
+    while pos < len(data):
+        z = data.find(b"\x00", pos)
+        if z <= pos:
+            pos += 1
+            continue
+        raw = data[pos:z]
+        pos = z + 1
+        if len(raw) < 3 or len(raw) > 120:
+            continue
+        if not all(32 <= b < 127 for b in raw):
+            continue
+        try:
+            text = raw.decode("ascii")
+        except Exception:
+            continue
+        if text.endswith(".atc.bof"):
+            base = text[: -len(".atc.bof")]
+            if base not in seen:
+                seen.add(base)
+                deps.append(base)
+            continue
+        if text.startswith(("TD_", "TN_", "TL_", "TS_")) and not text.endswith(".atc"):
+            if text not in seen:
+                seen.add(text)
+                deps.append(text)
+    return deps
+
+
+def _read_uv_u16(data, off):
+    a, b = struct.unpack_from("<HH", data, off)
+    return a / 65535.0, b / 65535.0
+
+
+def half_to_float(h):
+    """IEEE half -> float (Noesis Python has no struct 'e')."""
+    h &= 0xFFFF
+    s = (h >> 15) & 1
+    e = (h >> 10) & 0x1F
+    m = h & 0x3FF
+    if e == 0:
+        if m == 0:
+            return 0.0
+        val = (m / 1024.0) * (2 ** -14)
+        return -val if s else val
+    if e == 31:
+        return 0.0
+    val = (1.0 + m / 1024.0) * (2 ** (e - 15))
+    return -val if s else val
+
+
+def _read_uv_half(data, off):
+    a, b = struct.unpack_from("<HH", data, off)
+    return half_to_float(a), half_to_float(b)
+
+
+def _uv_edge_ratio_score(data, vstart, vert_count, stride, istart, uoff, fmt, samples=160):
+    """Higher = UV stretch better matches 3D triangle stretch."""
+    if istart < 0 or istart + 6 > len(data):
+        return 0
+
+    def pos(vi):
+        return struct.unpack_from("<3f", data, vstart + vi * stride)
+
+    def uv(vi):
+        if fmt == "HH":
+            return _read_uv_u16(data, vstart + vi * stride + uoff)
+        return _read_uv_half(data, vstart + vi * stride + uoff)
+
+    score = 0
+    tested = 0
+    for t in range(samples):
+        off = istart + t * 6
+        if off + 6 > len(data):
+            break
+        i0, i1, i2 = struct.unpack_from("<3H", data, off)
+        if max(i0, i1, i2) >= vert_count:
+            continue
+
+        def edge3(a, b):
+            pa, pb = pos(a), pos(b)
+            return ((pa[0] - pb[0]) ** 2 + (pa[1] - pb[1]) ** 2 + (pa[2] - pb[2]) ** 2) ** 0.5
+
+        def edge_uv(a, b):
+            ua, va = uv(a)
+            ub, vb = uv(b)
+            return ((ua - ub) ** 2 + (va - vb) ** 2) ** 0.5
+
+        e3 = sorted([edge3(i0, i1), edge3(i1, i2), edge3(i2, i0)])
+        euv = sorted([edge_uv(i0, i1), edge_uv(i1, i2), edge_uv(i2, i0)])
+        if e3[2] <= 1e-6 or euv[2] <= 1e-8:
+            continue
+        tested += 1
+        if abs(e3[0] / e3[2] - euv[0] / euv[2]) < 0.45:
+            score += 1
+
+    return score, tested
+
+
+def detect_uv_offset(data, vstart, vert_count, stride):
+    """
+    Echo BOF stores UVs as half2 in the vertex (typ. offset 19 on stride 35).
+    uint16 pairs at offset 18 are a byte-shifted misread of the same stream.
+    """
+    if vert_count < 1 or stride < 22:
+        return None, None
+
+    istart = vstart + vert_count * stride
+    best = None
+
+    for uoff in range(16, min(stride - 3, 28)):
+        for fmt in ("half", "HH"):
+            ok = 0
+            min_u = min_v = 1e9
+            max_u = max_v = -1e9
+            sample_n = min(vert_count, 512)
+            for vi in range(sample_n):
+                off = vstart + vi * stride + uoff
+                if off + 4 > len(data):
+                    break
+                if fmt == "HH":
+                    u, v = _read_uv_u16(data, off)
+                else:
+                    u, v = _read_uv_half(data, off)
+                if 0.0 <= u <= 1.05 and 0.0 <= v <= 1.05 and u > 0.001 and v > 0.001:
+                    ok += 1
+                    if u < min_u:
+                        min_u = u
+                    if v < min_v:
+                        min_v = v
+                    if u > max_u:
+                        max_u = u
+                    if v > max_v:
+                        max_v = v
+            if ok < max(32, sample_n * 0.25):
+                continue
+            spread_u = max_u - min_u
+            spread_v = max_v - min_v
+            if spread_u < 0.08 or spread_v < 0.08:
+                continue
+
+            corr, tested = _uv_edge_ratio_score(
+                data, vstart, vert_count, stride, istart, uoff, fmt
+            )
+            if tested > 0 and corr < tested * 0.65:
+                continue
+
+            ratio = float(corr) / float(tested) if tested > 0 else 0.0
+            score = ratio * 10000.0 + ok + spread_u * 10.0 + spread_v * 10.0
+            rec = (score, uoff, fmt, ok, spread_u, spread_v, corr, tested)
+            if best is None or rec[0] > best[0]:
+                best = rec
+
+    if best is None:
+        return None, None
+    _score, uoff, fmt, ok, spread_u, spread_v, corr, tested = best
+    print("DOT: UV offset=%d fmt=%s valid=%d spread=(%.3f,%.3f) stretch=%d/%d" % (
+        uoff, fmt, ok, spread_u, spread_v, corr, tested))
+    return uoff, fmt
+
+
+def read_vertex_uv(data, vstart, vi, stride, uv_off, uv_fmt):
+    off = vstart + vi * stride + uv_off
+    if uv_fmt == "HH":
+        u, v = _read_uv_u16(data, off)
+    else:
+        u, v = _read_uv_half(data, off)
+    return u, v
+
+
+def parse_skin_weights(data, vstart, vi, stride, bone_count, w_off=25, b_off=28):
+    """
+    Echo BOF skin block (stride 35):
+      weights uint8 x3 @25, bone indices uint8 x3 @28.
+    Index 0 with tiny weight is an unused slot, not SKL_RAGNAR.
+    """
+    if stride < b_off + 3 or bone_count <= 0:
+        return []
+    base = vstart + vi * stride
+    if base + b_off + 3 > len(data):
+        return []
+
+    w0, w1, w2 = struct.unpack_from("<3B", data, base + w_off)
+    b0, b1, b2 = struct.unpack_from("<3B", data, base + b_off)
+
+    raw = []
+    for weight, bone_idx in ((w0, b0), (w1, b1), (w2, b2)):
+        if weight <= 0 or bone_idx >= bone_count:
+            continue
+        raw.append((int(bone_idx), float(weight)))
+
+    if not raw:
+        return []
+
+    active = [(bi, wt) for bi, wt in raw if bi > 0]
+    if not active:
+        active = list(raw)
+
+    total = sum(wt for _, wt in active)
+    if total <= 1e-6:
+        return []
+    return [(bi, wt / total) for bi, wt in active]
+
+
+def detect_skin_offsets(data, vstart, vert_count, stride, bone_count):
+    """Find weight/bone byte offsets inside the vertex."""
+    if vert_count < 32 or stride < 32 or bone_count <= 0:
+        return 25, 28
+
+    best = None
+    for w_off in range(16, min(stride - 6, 30)):
+        b_off = w_off + 3
+        if b_off + 3 > stride:
+            continue
+        valid = 0
+        for vi in range(min(vert_count, 512)):
+            pairs = parse_skin_weights(
+                data, vstart, vi, stride, bone_count, w_off, b_off
+            )
+            if pairs:
+                valid += 1
+        if valid < max(32, min(vert_count, 512) * 0.35):
+            continue
+        rec = (valid, w_off, b_off)
+        if best is None or rec[0] > best[0]:
+            best = rec
+
+    if best is None:
+        return 25, 28
+    valid, w_off, b_off = best
+    print("DOT: skin w@%d b@%d valid=%d" % (w_off, b_off, valid))
+    return w_off, b_off
+
+
+def resolve_texture_path(base_dir, tex_name):
+    if not base_dir:
+        return None
+    base_dir = base_dir.replace("\\", "/")
+    if not base_dir.endswith("/"):
+        base_dir += "/"
+    candidates = [
+        base_dir + tex_name + ".png",
+        base_dir + tex_name + "/" + tex_name + ".png",
+        base_dir + tex_name + ".dds",
+        base_dir + tex_name + ".tga",
+        base_dir + tex_name + ".jpg",
+    ]
+    for path in candidates:
+        if rapi.checkFileExists(path):
+            return path
+    return None
+
+
+def load_material_textures(data):
+    """Un material con diffuse + normal según NAME-TEXTURES / capas del BOF."""
+    input_name = rapi.getInputName()
+    base_dir = rapi.getDirForFilePath(input_name) if input_name else ""
+
+    bindings = parse_material_texture_bindings(data)
+    diffuse_name = None
+    normal_name = None
+    spec_name = None
+
+    for layer, tex_name in bindings:
+        layer_up = layer.upper()
+        tex_up = tex_name.upper()
+        if diffuse_name is None and (
+            layer_up in ("DIFFUSE", "DIFFUSEMAP", "ALBEDO") or tex_up.startswith("TD_")
+        ):
+            diffuse_name = tex_name
+        elif normal_name is None and (
+            layer_up in ("NORMALMAP", "NORMAL", "BUMP") or tex_up.startswith("TN_")
+        ):
+            normal_name = tex_name
+        elif spec_name is None and (
+            layer_up in ("SPECULAR", "SPEC") or tex_up.startswith("TS_")
+        ):
+            spec_name = tex_name
+
+    if diffuse_name is None or normal_name is None:
+        for tex_name in parse_texture_names(data):
+            tex_up = tex_name.upper()
+            if diffuse_name is None and tex_up.startswith("TD_"):
+                diffuse_name = tex_name
+            elif normal_name is None and tex_up.startswith("TN_"):
+                normal_name = tex_name
+            elif spec_name is None and tex_up.startswith("TS_"):
+                spec_name = tex_name
+
+    mat = NoeMaterial("DOT_mat", "")
+    try:
+        flags = noesis.NMATFLAG_TWOSIDED
+        if normal_name:
+            flags |= noesis.NMATFLAG_NORMALMAP
+        mat.setFlags(flags)
+    except Exception:
+        pass
+
+    if diffuse_name:
+        tex_path = resolve_texture_path(base_dir, diffuse_name)
+        if tex_path:
+            tex = rapi.loadExternalTex(tex_path)
+            if tex:
+                try:
+                    mat.setTexture("Diffuse", tex)
+                except Exception:
+                    pass
+                try:
+                    mat.setDiffuseTexture(tex)
+                except Exception:
+                    pass
+                print("DOT: diffuse=%s" % tex_path)
+
+    if normal_name:
+        n_path = resolve_texture_path(base_dir, normal_name)
+        if n_path:
+            ntex = rapi.loadExternalTex(n_path)
+            if ntex:
+                try:
+                    mat.setTexture("Normal", ntex)
+                except Exception:
+                    pass
+                try:
+                    mat.setNormalTexture(ntex)
+                except Exception:
+                    pass
+                print("DOT: normal=%s" % n_path)
+
+    if spec_name:
+        s_path = resolve_texture_path(base_dir, spec_name)
+        if s_path:
+            stex = rapi.loadExternalTex(s_path)
+            if stex:
+                try:
+                    mat.setTexture("Specular", stex)
+                except Exception:
+                    pass
+                print("DOT: spec=%s" % s_path)
+
+    if diffuse_name is None and normal_name is None:
+        try:
+            mat.setDiffuseColor(NoeVec4((0.82, 0.82, 0.86, 1.0)))
+        except Exception:
+            pass
+
+    print("DOT: material bindings=%s" % (
+        ", ".join("%s:%s" % (layer, tex) for layer, tex in bindings) or "none"))
+    return [mat]
+
+
+def parse_material_slots(data):
+    slots = []
+    off = find_section(data, "NAME-MATERIALLAYERS")
+    if off < 0:
+        off = find_section(data, "NAME-MATERIALS")
+    if off < 0:
+        return slots
+    end = off + 4096
+    pos = off + 32
+    while pos < end:
+        z = data.find(b"\x00", pos)
+        if z <= pos:
+            pos += 1
+            continue
+        raw = data[pos:z]
+        pos = z + 1
+        if len(raw) < 2 or len(raw) > 64:
+            continue
+        try:
+            s = raw.decode("ascii")
+        except Exception:
+            continue
+        if s.startswith("NAME-"):
+            break
+        if s.isprintable() and s not in slots:
+            slots.append(s)
+    return slots
+
+
+def parse_material_texture_bindings(data):
+    layers = parse_material_slots(data)
+    textures = parse_texture_names(data)
+    if not layers or not textures:
+        return [(tex, tex) for tex in textures]
+    pairs = []
+    for i, layer in enumerate(layers):
+        if i < len(textures):
+            pairs.append((layer, textures[i]))
+    for i in range(len(layers), len(textures)):
+        pairs.append((textures[i], textures[i]))
+    return pairs
 
 
 def _valid_pos(x, y, z, limit=20.0):
@@ -571,34 +1337,70 @@ def detect_vertex_layout(data, vert_count, index_count):
     return vstart, stride, istart, span_y, min_y, max_y, geo_off
 
 
-def build_bones(names, min_y, max_y, cx, cz):
-    if not names:
-        return []
-    height = max(max_y - min_y, 0.001)
-    sk_root = names[0] if names[0].upper().startswith("SK_") else None
-    name_set = set(names)
-    bones = []
-    for i, name in enumerate(names):
-        parent = guess_parent(name, name_set, sk_root)
-        y = min_y + height * (0.15 + 0.7 * (float(i) / max(len(names) - 1, 1)))
-        mat = NoeMat43()
-        try:
-            mat[3] = NoeVec3((cx, y, cz))
-        except Exception:
-            pass
-        bones.append(NoeBone(i, name, mat, parent))
-    return bones
+def _mesh_bounds_key(min_x, max_x, min_y, max_y, vc_eff):
+    return (
+        int(round(min_x * 100)),
+        int(round(max_x * 100)),
+        int(round(min_y * 100)),
+        int(round(max_y * 100)),
+        int(vc_eff),
+    )
+
+
+def _find_best_mesh_on_geo(data, geo_off, mesh_counts, seen_bounds):
+    """Best validated mesh for one MATERIALS-GEOMETRY2 block."""
+    best = None
+    for vc, ic in sorted(mesh_counts, key=lambda pair: pair[0], reverse=True):
+        for delta in (4, 0, 8):
+            for stride in (39, 43, 47, 35, 51, 31, 37, 41, 45):
+                vstart = geo_off + 32 + delta
+                info = validate_submesh(data, vstart, vc, ic, stride, relaxed=True)
+                if info is None:
+                    continue
+                vc_eff, idxs, min_y, max_y, min_x, max_x, min_z, max_z, long_frac = info
+                if vc_eff < int(vc * 0.95):
+                    continue
+                keep_ratio = float(len(idxs)) / float(ic)
+                if keep_ratio < 0.95:
+                    continue
+                if long_frac > 0.10:
+                    continue
+                span_x = max_x - min_x
+                span_y = max_y - min_y
+                if span_x < 0.05 or span_y < 0.05:
+                    continue
+                bounds_key = _mesh_bounds_key(min_x, max_x, min_y, max_y, vc_eff)
+                if bounds_key in seen_bounds:
+                    continue
+                score = vc_eff + keep_ratio * 1000.0 + span_y * 10.0
+                rec = (
+                    score,
+                    vstart,
+                    vc_eff,
+                    idxs,
+                    stride,
+                    min_y,
+                    max_y,
+                    min_x,
+                    max_x,
+                    vc,
+                    ic,
+                    bounds_key,
+                )
+                if best is None or rec[0] > best[0]:
+                    best = rec
+    return best
 
 
 def collect_meshes(data):
     """
-    Collect all co-located render meshes:
-      1) MATERIALS-HEADER chain at the first working GEOMETRY2
-      2) Each MESH-HEADER count pair on every GEOMETRY2 (full-body LODs, etc.)
+    Collect all render meshes:
+      1) MATERIALS-HEADER chain on the first GEOMETRY2 (only verified links)
+      2) Best MESH-HEADER mesh on every GEOMETRY2 block (multi-part heroes)
     """
-    # Each entry: (vstart, vc_eff, indices, stride, min_y, max_y, min_x, max_x)
     loaded = []
     seen_starts = set()
+    seen_bounds = set()
 
     def add_mesh(vstart, vc, ic, stride, label, relaxed=False):
         key = (vstart, vc, ic, stride, relaxed)
@@ -609,17 +1411,23 @@ def collect_meshes(data):
             return False
         seen_starts.add(key)
         vc_eff, idxs, min_y, max_y, min_x, max_x, min_z, max_z, _lf = info
-        # De-dupe by effective range.
+        span_x = max_x - min_x
+        span_y = max_y - min_y
+        if span_x < 0.05 or span_y < 0.05:
+            return False
+        bounds_key = _mesh_bounds_key(min_x, max_x, min_y, max_y, vc_eff)
+        if bounds_key in seen_bounds:
+            return False
         range_key = (vstart, vc_eff, stride)
         for item in loaded:
             if (item[0], item[1], item[3]) == range_key:
                 return False
+        seen_bounds.add(bounds_key)
         loaded.append((vstart, vc_eff, idxs, stride, min_y, max_y, min_x, max_x))
         print("DOT: %s vc=%d/%d tris=%d stride=%d Y=[%.3f,%.3f] X=[%.3f,%.3f]" % (
             label, vc_eff, vc, len(idxs) // 3, stride, min_y, max_y, min_x, max_x))
         return True
 
-    # --- 1) Materials chain (strict) ---
     submesh_counts = parse_submesh_counts(data)
     _sub, vert_count, index_count = parse_materials_header(data)
     if not submesh_counts and vert_count > 0 and index_count > 0:
@@ -639,33 +1447,45 @@ def collect_meshes(data):
             print("DOT: chain geo=%s vstart=%s stride=%d" % (
                 hex(geo_off), hex(vstart), stride))
             cursor = vstart
+            chain_parts = []
             for si, (vc, ic) in enumerate(submesh_counts):
-                if not add_mesh(cursor, vc, ic, stride, "part%d" % si, relaxed=False):
-                    # Header chain parts: allow slight tail garbage.
-                    if not add_mesh(cursor, vc, ic, stride, "part%d" % si, relaxed=True):
-                        if si == 0:
-                            break
-                        print("DOT: chain stopped at part %d" % si)
-                        break
-                # Advance using declared counts (layout in file).
+                info = validate_submesh(data, cursor, vc, ic, stride, relaxed=True)
+                if info is None:
+                    print("DOT: chain stopped at part %d" % si)
+                    break
+                chain_parts.append((cursor, vc, ic))
                 cursor = cursor + vc * stride + ic * 2
+            for si, (cursor, vc, ic) in enumerate(chain_parts):
+                add_mesh(cursor, vc, ic, stride, "part%d" % si, relaxed=True)
 
-    # --- 2) Standalone MESH-HEADER meshes (relaxed: secondary bodies) ---
     geos = find_all_sections(data, "MATERIALS-GEOMETRY2")
     mesh_counts = parse_mesh_header_counts(data)
     for gi, geo_off in enumerate(geos):
-        for vc, ic in mesh_counts:
-            already = sum(m[1] for m in loaded)
-            if vc == already and len(loaded) > 1:
-                continue
-            for delta in (4, 0):
-                for stride in (31, 39, 43, 47, 51, 35, 37, 41, 45):
-                    vstart = geo_off + 32 + delta
-                    if add_mesh(vstart, vc, ic, stride, "meshhdr_g%d" % gi, relaxed=True):
-                        break
-                else:
-                    continue
-                break
+        best = _find_best_mesh_on_geo(data, geo_off, mesh_counts, seen_bounds)
+        if best is None:
+            continue
+        (
+            _score,
+            vstart,
+            vc_eff,
+            idxs,
+            stride,
+            min_y,
+            max_y,
+            min_x,
+            max_x,
+            vc_decl,
+            ic_decl,
+            bounds_key,
+        ) = best
+        key = (vstart, vc_decl, ic_decl, stride, True)
+        if key in seen_starts:
+            continue
+        seen_starts.add(key)
+        seen_bounds.add(bounds_key)
+        loaded.append((vstart, vc_eff, idxs, stride, min_y, max_y, min_x, max_x))
+        print("DOT: geo%d vc=%d/%d tris=%d stride=%d Y=[%.3f,%.3f] X=[%.3f,%.3f]" % (
+            gi, vc_eff, vc_decl, len(idxs) // 3, stride, min_y, max_y, min_x, max_x))
 
     print("DOT: collected %d mesh piece(s)" % len(loaded))
     return loaded
@@ -680,12 +1500,30 @@ def noepyLoadModel(data, mdlList):
         print("DOT: no submeshes loaded")
         return 0
 
+    names = parse_joint_names(data)
+    bone_count = len(names)
+
     # Merge all parts into one mesh (indices offset per part).
     pos_tuples = []
+    uv_tuples = []
+    vert_weights = []
     indices = []
     min_x = min_y = min_z = 1e9
     max_x = max_y = max_z = -1e9
-    for vstart_i, vc, idxs, stride, _miny, _maxy, _minx, _maxx in loaded:
+    uv_off = None
+    uv_fmt = None
+    skin_w_off = None
+    skin_b_off = None
+    skinned_verts = 0
+
+    for part_i, (vstart_i, vc, idxs, stride, _miny, _maxy, _minx, _maxx) in enumerate(loaded):
+        if uv_off is None:
+            uv_off, uv_fmt = detect_uv_offset(data, vstart_i, vc, stride)
+        if skin_w_off is None and bone_count > 0:
+            skin_w_off, skin_b_off = detect_skin_offsets(
+                data, vstart_i, vc, stride, bone_count
+            )
+
         base_vertex = len(pos_tuples)
         for vi in range(vc):
             px, py, pz = struct.unpack_from("<3f", data, vstart_i + vi * stride)
@@ -696,6 +1534,31 @@ def noepyLoadModel(data, mdlList):
             if px > max_x: max_x = px
             if py > max_y: max_y = py
             if pz > max_z: max_z = pz
+
+            if uv_off is not None and uv_fmt is not None:
+                u, v = read_vertex_uv(data, vstart_i, vi, stride, uv_off, uv_fmt)
+                uv_tuples.append((u, v))
+            else:
+                uv_tuples.append((0.0, 0.0))
+
+            if bone_count > 0 and skin_w_off is not None:
+                vw = parse_skin_weights(
+                    data,
+                    vstart_i,
+                    vi,
+                    stride,
+                    bone_count,
+                    skin_w_off,
+                    skin_b_off,
+                )
+                if vw:
+                    bone_ids = [bi for bi, _w in vw]
+                    bone_wts = [_w for _bi, _w in vw]
+                    vert_weights.append(NoeVertWeight(bone_ids, bone_wts))
+                    skinned_verts += 1
+                else:
+                    vert_weights.append(NoeVertWeight([], []))
+
         for idx in idxs:
             indices.append(base_vertex + int(idx))
 
@@ -727,6 +1590,7 @@ def noepyLoadModel(data, mdlList):
 
     positions = []
     normals = []
+    uvs = []
     for vi in range(vert_count):
         px, py, pz = pos_tuples[vi]
         positions.append(NoeVec3((px, py, pz)))
@@ -736,6 +1600,8 @@ def noepyLoadModel(data, mdlList):
             normals.append(NoeVec3((nx / length, ny / length, nz / length)))
         else:
             normals.append(NoeVec3((0.0, 1.0, 0.0)))
+        u, v = uv_tuples[vi]
+        uvs.append(NoeVec3((u, v, 0.0)))
 
     both = list(indices)
     for t in range(tri_count):
@@ -744,31 +1610,25 @@ def noepyLoadModel(data, mdlList):
         i2 = indices[t * 3 + 2]
         both.extend((i0, i2, i1))
 
-    mat_name = "DOT_default"
-    material = NoeMaterial(mat_name, "")
-    try:
-        material.setDiffuseColor(NoeVec4((0.82, 0.82, 0.86, 1.0)))
-    except Exception:
-        pass
-    try:
-        material.setFlags(noesis.NMATFLAG_TWOSIDED)
-    except Exception:
-        pass
+    materials = load_material_textures(data)
+    mat_name = materials[0].name if materials else "DOT_mat"
 
     mesh = NoeMesh(both, positions, "GEO_BODY", mat_name)
     mesh.setNormals(normals)
+    mesh.setUVs(uvs)
+    if vert_weights and len(vert_weights) == vert_count:
+        mesh.setWeights(vert_weights)
+        print("DOT: skin weights=%d/%d" % (skinned_verts, vert_count))
 
-    names = parse_joint_names(data)
-    cx = (min_x + max_x) * 0.5
-    cz = (min_z + max_z) * 0.5
-    bones = build_bones(names, min_y, max_y, cx, cz)
-    print("DOT: parts=%d joints=%d bones=%d" % (len(loaded), len(names), len(bones)))
+    bones = build_bones(names, (min_x, max_x, min_y, max_y, min_z, max_z), data)
+    print("DOT: parts=%d joints=%d bones=%d tex=%d" % (
+        len(loaded), len(names), len(bones), len(parse_texture_names(data))))
 
     mdl = NoeModel([mesh], bones)
-    mdl.setModelMaterials(NoeModelMaterials([], [material]))
+    mdl.setModelMaterials(NoeModelMaterials([], materials))
     if bones:
         mdl.setBones(bones)
 
     mdlList.append(mdl)
-    print("DOT: OK — press F or A if the view is empty")
+    print("DOT: OK — texturas: PNGs TD_/TN_ junto al .dotmesh | UV: tecla U")
     return 1
