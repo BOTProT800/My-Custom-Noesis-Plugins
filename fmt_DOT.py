@@ -10,14 +10,19 @@
 # Los comentarios en ASCII sin acentos son a proposito: este archivo lo ejecuta
 # el interprete que Noesis lleva dentro, no el del repositorio.
 #
-# Instalar: copiar fmt_DOT.py y text_DOT.py a Noesis/plugins/python/
-# (sobrescribiendo las copias viejas) y reiniciar Noesis.
+# Instalar: copiar fmt_DOT.py, text_DOT.py y anim_DOT.py a
+# Noesis/plugins/python/ (sobrescribiendo las copias viejas) y reiniciar Noesis.
 # Abrir: el .atc.bof del juego tal cual, el .atc descomprimido o un .dotmesh
 # (los mismos bytes). Las texturas las pone text_DOT.py: las incrustadas en el
 # archivo y las que nombra DEPENDENCIES, buscadas junto a la malla y en
 # Media/3d/Textures. Al exportar la malla, Noesis escribe tambien las texturas.
 # Sin text_DOT.py solo se abren los .atc descomprimidos, sin texturas del juego.
+# Las animaciones las pone anim_DOT.py: el clip del propio archivo y todos los
+# de su red de morpheme en Media/RuntimeNetwork/<modelo>/, siempre que el
+# modelo se abra desde dentro de la carpeta Media del juego.
 # Opcion -dotnotex: carga sin texturas, mucho mas rapido.
+# Opcion -dotnoanims: sin las animaciones de RuntimeNetwork.
+# Opcion -dotinplace: las animaciones en el sitio, sin desplazamiento.
 # Ver las UVs en Noesis: tecla U.
 
 from inc_noesis import *
@@ -31,6 +36,11 @@ try:
     import text_DOT
 except ImportError:
     text_DOT = None
+
+try:
+    import anim_DOT
+except ImportError:
+    anim_DOT = None
 
 DOT_MAGIC = b"VERSION\x00"
 
@@ -51,6 +61,8 @@ DOT_PARENTS = {
 
 DOT_OPT_MARKERS = "-dotfx"
 DOT_OPT_NOTEX = "-dotnotex"
+DOT_OPT_NONET = "-dotnoanims"
+DOT_OPT_INPLACE = "-dotinplace"
 
 
 def registerNoesisTypes():
@@ -73,6 +85,13 @@ def registerNoesisTypes():
             noesis.addOption(
                 opt_handle, DOT_OPT_NOTEX,
                 "carga la malla sin decodificar sus texturas", 0)
+            noesis.addOption(
+                opt_handle, DOT_OPT_NONET,
+                "solo el clip del propio archivo, sin las animaciones de"
+                " Media/RuntimeNetwork", 0)
+            noesis.addOption(
+                opt_handle, DOT_OPT_INPLACE,
+                "anima en el sitio, sin el desplazamiento de la trayectoria", 0)
         except Exception:
             pass
     return 1
@@ -94,6 +113,24 @@ def want_textures():
         return not noesis.optWasInvoked(DOT_OPT_NOTEX)
     except Exception:
         return True
+
+
+def want_network_anims():
+    """False si se ha pedido -dotnoanims o falta anim_DOT.py."""
+    if anim_DOT is None:
+        return False
+    try:
+        return not noesis.optWasInvoked(DOT_OPT_NONET)
+    except Exception:
+        return True
+
+
+def want_in_place():
+    """True si se ha pedido animar sin la trayectoria (-dotinplace)."""
+    try:
+        return bool(noesis.optWasInvoked(DOT_OPT_INPLACE))
+    except Exception:
+        return False
 
 
 def _byte_at(data, idx):
@@ -1037,6 +1074,18 @@ def _at_origin(pos):
         and abs(pos[2]) < DOT_ORIGIN_EPS
 
 
+def hooks_without_pose(records, con_peso=None):
+    """Los enganches sin pose que se cuelgan de su padre (ver arriba)."""
+    con_peso = con_peso or set()
+    out = set()
+    for i, (parent, _name_index, _rows, pos) in enumerate(records):
+        if (parent != DOT_BONE_NO_PARENT and parent < len(records) and parent != i
+                and i not in con_peso and _at_origin(pos)
+                and not _at_origin(records[parent][3])):
+            out.add(i)
+    return out
+
+
 def _bones_from_skeleton(names, records, con_peso=None):
     """Un NoeBone por registro, con la matriz de modelo que trae el archivo.
 
@@ -1048,13 +1097,11 @@ def _bones_from_skeleton(names, records, con_peso=None):
     esten ahi se quedan donde el archivo los pone.
     """
     bone_names = skeleton_bone_names(names, records)
-    con_peso = con_peso or set()
+    hooks = hooks_without_pose(records, con_peso)
     colgados = []
     bones = []
     for i, (parent, _name_index, rows, pos) in enumerate(records):
-        if (parent != DOT_BONE_NO_PARENT and parent < len(records) and parent != i
-                and i not in con_peso and _at_origin(pos)
-                and not _at_origin(records[parent][3])):
+        if i in hooks:
             rows = records[parent][2]
             pos = records[parent][3]
             colgados.append(bone_names[i])
@@ -1564,16 +1611,38 @@ def _noe_mat(rows, trans):
     convenciones distintas el personaje sale hecho trizas. Medido contra la
     deformacion de referencia del arnes: transponiendo las dos, el FBX que
     escribe Noesis reproduce vertice a vertice lo que calcula el arnes.
+
+    Se construye de una vez con la tupla de filas: NoeMat43() sin argumentos
+    hace un deepcopy de la identidad, que sobra cuando un personaje trae miles
+    de fotogramas entre todos sus clips.
     """
-    mat = NoeMat43()
-    mat[0] = NoeVec3((rows[0][0], rows[1][0], rows[2][0]))
-    mat[1] = NoeVec3((rows[0][1], rows[1][1], rows[2][1]))
-    mat[2] = NoeVec3((rows[0][2], rows[1][2], rows[2][2]))
-    mat[3] = NoeVec3(trans)
-    return mat
+    return NoeMat43((
+        NoeVec3((rows[0][0], rows[1][0], rows[2][0])),
+        NoeVec3((rows[0][1], rows[1][1], rows[2][1])),
+        NoeVec3((rows[0][2], rows[1][2], rows[2][2])),
+        NoeVec3((trans[0], trans[1], trans[2]))))
 
 
-def build_anim(name, tracks, records, names, locals_, bones):
+DOT_QUAT_IDENTITY = (0.0, 0.0, 0.0, 1.0)
+
+
+def rest_locals(records, locals_, hooks):
+    """[(cuaternion, traslacion)] local de reparto de cada hueso.
+
+    La del registro, salvo en los enganches sin pose: a esos la pose de reparto
+    los cuelga de su padre, asi que en local son la identidad. Con el valor del
+    registro, un enganche sin pista se iria al origen en cuanto empieza el clip.
+    """
+    out = []
+    for i in range(len(records)):
+        if i in hooks or i >= len(locals_):
+            out.append((DOT_QUAT_IDENTITY, (0.0, 0.0, 0.0)))
+        else:
+            out.append(locals_[i])
+    return out
+
+
+def build_anim(name, tracks, records, names, locals_, bones, hooks=None):
     """Un NoeAnim con la matriz local de cada hueso en cada fotograma.
 
     Se entrega en matrices y no en cuaterniones a proposito: NoeKeyFramedAnim
@@ -1597,11 +1666,8 @@ def build_anim(name, tracks, records, names, locals_, bones):
     fps = tracks[0].fps or DOT_ANIM_FPS
     frames = max(len(tracks[i].keys) for i in mapping) or 1
     by_bone = dict((bone, tracks[i]) for i, bone in mapping.items())
-    quietos = []
-    for i in range(len(records)):
-        quat, trans = locals_[i] if i < len(locals_) else ((0.0, 0.0, 0.0, 1.0),
-                                                          (0.0, 0.0, 0.0))
-        quietos.append((_mat_from_quat(quat), trans))
+    quietos = [(_mat_from_quat(quat), trans)
+               for quat, trans in rest_locals(records, locals_, hooks or set())]
 
     mats = []
     for frame in range(frames):
@@ -1906,27 +1972,21 @@ def load_node_animation(data, roots, mdl, tracks, bones, binds, por_hueso):
         print("DOT: %d pista(s) de nodo sin casar; se quedan quietas" % sueltas)
 
 
-def load_animation(data, roots, mdl, records, names, bones):
-    """Le pasa a Noesis la animacion del esqueleto del modelo, si la hay."""
+def load_embedded_animation(data, roots, records, names, bones, hooks):
+    """(NoeAnim, fps) del clip de SCENE-ANIMATIONS, o (None, None)."""
     tracks = parse_animations(data, roots)
     if not tracks:
         # Decirlo: la mayoria de los archivos no traen clip, y sin una linea
         # aqui uno se queda mirando el visor sin saber si falla el plugin.
         print("DOT: el archivo no trae animacion (SCENE-ANIMATIONS vacia)")
-        return
+        return None, None
     anim, info = build_anim(
         animation_name(data, roots), tracks, records, names,
-        skeleton_locals(data, roots), bones)
+        skeleton_locals(data, roots), bones, hooks)
     if anim is None:
         print("DOT: %d pista(s) de animacion que no casan con el esqueleto"
               % len(tracks))
-        return
-    try:
-        mdl.setAnims([anim])
-    except Exception as exc:
-        print("DOT: Noesis no acepto la animacion (%s)" % exc)
-        return
-    set_preview_fps(info["fps"])
+        return None, None
     print("DOT: animacion %s — %d fotograma(s) a %d fps, %d de %d pista(s)"
           " en el esqueleto" % (
               animation_name(data, roots), info["fotogramas"], info["fps"],
@@ -1938,6 +1998,344 @@ def load_animation(data, roots, mdl, records, names, bones):
         if sueltas:
             detalle += (", " if detalle else "") + "%d de nodos de escena" % sueltas
         print("DOT: %d pista(s) mas que no se reproducen: %s" % (sobran, detalle))
+    return anim, info["fps"]
+
+
+def load_animation(data, roots, mdl, records, names, bones, con_peso=None):
+    """Le pasa a Noesis todas las animaciones del esqueleto del modelo.
+
+    Primero el clip del propio archivo, si lo trae, y detras los de
+    Media/RuntimeNetwork. Noesis las junta en una sola animacion con una
+    secuencia por clip: en el visor se reproducen seguidas, y cada una se ve
+    por separado eligiendola en Tools > Data Viewer > Animations.
+    """
+    hooks = hooks_without_pose(records, con_peso)
+    anims = []
+    fps = None
+    anim, anim_fps = load_embedded_animation(data, roots, records, names, bones, hooks)
+    if anim is not None:
+        anims.append(anim)
+        fps = anim_fps
+    for anim in load_network_animations(data, roots, records, names, bones, hooks):
+        anims.append(anim)
+        if fps is None:
+            fps = anim.frameRate
+    if not anims:
+        return
+    try:
+        mdl.setAnims(anims)
+    except Exception as exc:
+        print("DOT: Noesis no acepto las animaciones (%s)" % exc)
+        return
+    set_preview_fps(fps or DOT_ANIM_FPS)
+    if len(anims) > 1:
+        print("DOT: %d animacion(es) en total; cada una por separado en"
+              " Tools > Data Viewer > Animations" % len(anims))
+
+
+# --------------------------------------------------------------------------
+# Las animaciones de RuntimeNetwork
+#
+# anim_DOT.py lee la red de morpheme del personaje y descomprime sus clips;
+# aqui se pasan al esqueleto del .atc. Cada canal del clip va a un hueso del
+# rig de morpheme, y ese hueso se busca por nombre en NAME-JOINTS: en
+# SK_MagicianElithenFemale_SuperRare_01_Game casan los 24 canales que no son
+# la trayectoria, con el mismo padre en los dos esqueletos.
+#
+# Los giros se toman tal cual. Las traslaciones, no siempre: los clips "Core"
+# se comparten entre personajes de proporciones distintas, y las traslaciones
+# que no cambian en todo el clip son las del rig con el que se animo, no las
+# del modelo. La maga elithen usa los clips de MagicianCoreMale: rodilla a
+# 0,45 del muslo en el clip y a 0,41 en su esqueleto. Esas se cambian por las
+# del modelo, que es lo que se exporta; las que se mueven -las claviculas- son
+# movimiento y se respetan, y la de la cadera se respeta siempre. Los
+# enganches sin pose tambien: su pose de reparto no dice donde van.
+#
+# La trayectoria se aplica al hueso raiz, que es lo que hace morpheme con el
+# personaje: la cadera va relativa a ella. Con -dotinplace no se aplica y los
+# clips de andar o girar se quedan en el sitio.
+# --------------------------------------------------------------------------
+
+
+# Huesos que solo existen en morpheme: nunca estan en NAME-JOINTS.
+DOT_RIG_ONLY = ("CHARACTERWORLDSPACETM", "TRAJECTORY")
+
+
+class DotNetworkPlan(object):
+    """Que canal del clip mueve cada hueso del modelo, para un mapa."""
+
+    def __init__(self, chan_of, keep_trans, missing, mismatched):
+        self.chan_of = chan_of          # {registro: canal}
+        self.keep_trans = keep_trans    # registros con la traslacion del clip
+        self.missing = missing          # huesos del rig que el modelo no tiene
+        self.mismatched = mismatched    # huesos con otro padre en el rig
+
+
+def plan_network_bones(rig, mapping, bone_names, records):
+    by_name = {}
+    for i, name in enumerate(bone_names):
+        by_name.setdefault(name.upper(), i)
+    chan_of = {}
+    keep_trans = set()
+    missing = []
+    mismatched = []
+    # La cadera (el hueso raiz del personaje para morpheme) lleva siempre la
+    # traslacion del clip, aunque sea constante: en una pose de un fotograma
+    # -agacharse, apuntar- su altura es movimiento, no proporcion.
+    if 0 < rig.root < len(rig.names):
+        root_record = by_name.get(rig.names[rig.root].upper())
+        if root_record is not None:
+            keep_trans.add(root_record)
+    for chan, rig_bone in enumerate(mapping.anim_to_rig):
+        # El hueso 0 (CharacterWorldSpaceTM) es el sumidero de los canales sin
+        # destino, y la trayectoria va aparte.
+        if rig_bone <= 0 or rig_bone >= len(rig.names) or rig_bone == rig.trajectory:
+            continue
+        name = rig.names[rig_bone]
+        if name.upper() in DOT_RIG_ONLY:
+            continue
+        record = by_name.get(name.upper())
+        if record is None:
+            missing.append(name)
+            continue
+        chan_of[record] = chan
+        rig_parent = rig.parent_name(rig_bone)
+        parent = records[record][0]
+        if rig_parent is None or parent >= len(bone_names):
+            continue
+        # La raiz SK_ se llama distinto en el rig (_Shop / _Game): se compara
+        # solo si el padre del rig existe tambien en el modelo.
+        if (rig_parent.upper() in by_name
+                and rig_parent.upper() != bone_names[parent].upper()):
+            mismatched.append(name)
+    return DotNetworkPlan(chan_of, keep_trans, missing, mismatched)
+
+
+# --------------------------------------------------------------------------
+# Clips aditivos
+#
+# Uno de cada ocho clips del juego no es una pose sino una diferencia que
+# morpheme suma encima de otra animacion: los IdleTick, Overlay y TiltHead de
+# las tiendas, y en los magos RangedAttackFire*, RangedTurn* y
+# WalkBackwardsAimed*. Se reconocen sin ambiguedad en el primer fotograma:
+# medido en los 59 clips de la maga elithen, los aditivos traen 24 de 24
+# giros identidad y 24 de 24 traslaciones a cero, y los demas 3 y 2 de 24.
+# Tal cual, el esqueleto se pliega sobre si mismo en el suelo.
+#
+# morpheme los suma asi (BlendOpsBase::additiveBlendQuats y
+# addQuatAddPosPartial): giro = delta * base, posicion = base + delta. Que
+# animacion es la base lo decide el grafo de la red, que aqui no se lee; se
+# toma el primer fotograma del clip de postura -Idle o Ready, sin "To"- cuyo
+# nombre comparta mas palabras con el aditivo: RangedAttackFire01 va sobre
+# RangedAttackReady, y los IdleTick sobre Idle.
+# --------------------------------------------------------------------------
+
+DOT_ADDITIVE_SHARE = 0.75
+DOT_STANCE_WORDS = ("IDLE", "READY")
+
+
+def _length(v):
+    return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+
+def is_additive(clip, plan, rest):
+    """True si el clip guarda diferencias y no poses (ver arriba)."""
+    ident = zeroed = long_bones = 0
+    for record, chan in plan.chan_of.items():
+        quat, trans = clip.key(chan, 0)
+        if abs(quat[3]) > 0.9995:
+            ident += 1
+        bind = _length(rest[record][1])
+        if bind > 0.02:
+            long_bones += 1
+            if _length(trans) < 0.2 * bind:
+                zeroed += 1
+    count = len(plan.chan_of)
+    return (count > 0 and long_bones > 0
+            and ident >= DOT_ADDITIVE_SHARE * count
+            and zeroed >= DOT_ADDITIVE_SHARE * long_bones)
+
+
+def _words(name):
+    out = []
+    word = ""
+    for ch in name:
+        if ch.isupper() or not ch.isalnum() or (ch.isdigit() != word[-1:].isdigit()):
+            if word:
+                out.append(word.upper())
+            word = ch if ch.isalnum() else ""
+        else:
+            word += ch
+    if word:
+        out.append(word.upper())
+    return out
+
+
+def _shared_words(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def pick_additive_base(name, absolutes):
+    """El clip absoluto sobre el que se suma *name*, o None."""
+    words = _words(name)
+    stances = [c for c in absolutes
+               if any(w in DOT_STANCE_WORDS for w in _words(c.name))
+               and "TO" not in _words(c.name)]
+    best = None
+    for cand in stances or absolutes:
+        key = (_shared_words(words, _words(cand.name)), -len(cand.name))
+        if best is None or key > best[0]:
+            best = (key, cand)
+    return best[1] if best else None
+
+
+def network_pose(loaded, plan, rest, hooks, frame, base=None):
+    """[(cuaternion, traslacion)] local de cada hueso en un fotograma.
+
+    Sin trayectoria. Con *base*, el clip se suma encima como aditivo.
+    """
+    clip = loaded.clip
+    out = []
+    for b in range(len(rest)):
+        out.append(_network_local(clip, plan, rest, hooks, b, frame, base))
+    return out
+
+
+def _network_local(clip, plan, rest, hooks, b, frame, base):
+    chan = plan.chan_of.get(b)
+    if base is not None:
+        if chan is None:
+            return base[b]
+        dq, dt = clip.key(chan, frame)
+        bq, bt = base[b]
+        return _quat_mul(dq, bq), (bt[0] + dt[0], bt[1] + dt[1], bt[2] + dt[2])
+    if chan is None:
+        return rest[b]
+    quat, trans = clip.key(chan, frame)
+    if not (clip.sampled_pos(chan) or b in hooks or b in plan.keep_trans):
+        trans = rest[b][1]
+    return quat, trans
+
+
+def build_network_anim(loaded, plan, rest, hooks, bones, in_place, base=None):
+    """Un NoeAnim con el clip de morpheme sobre el esqueleto del .atc.
+
+    *base* es la pose sobre la que se suma un clip aditivo, o None.
+    """
+    clip = loaded.clip
+    count = len(bones)
+    moving_root = clip.trajectory if (clip.trajectory and not in_place
+                                      and anim_DOT.trajectory_moves(clip)) else None
+    root_bones = set(i for i, bone in enumerate(bones) if bone.parentIndex < 0)
+    still = base if base is not None else rest
+
+    # Los huesos que no se mueven reutilizan la misma matriz en cada fotograma.
+    fixed = [None] * count
+    for b in range(count):
+        if b in plan.chan_of or (moving_root is not None and b in root_bones):
+            continue
+        quat, trans = still[b]
+        fixed[b] = _noe_mat(_mat_from_quat(quat), trans)
+
+    mats = []
+    for frame in range(clip.frames):
+        for b in range(count):
+            mat = fixed[b]
+            if mat is None:
+                quat, trans = _network_local(clip, plan, rest, hooks, b, frame, base)
+                if moving_root is not None and b in root_bones:
+                    tq, tp = moving_root[frame]
+                    tx, ty, tz = _quat_rotate(tq, trans[0], trans[1], trans[2])
+                    trans = (tx + tp[0], ty + tp[1], tz + tp[2])
+                    quat = _quat_mul(tq, quat)
+                mat = _noe_mat(_mat_from_quat(quat), trans)
+            mats.append(mat)
+    return NoeAnim(loaded.name, bones, clip.frames, mats, float(clip.fps))
+
+
+def load_network_animations(data, roots, records, names, bones, hooks):
+    """[NoeAnim] con los clips de Media/RuntimeNetwork del modelo."""
+    if not want_network_anims():
+        if anim_DOT is None:
+            print("DOT: sin anim_DOT.py no se cargan las animaciones de"
+                  " RuntimeNetwork")
+        return []
+    if not records:
+        return []
+    input_name = rapi.getInputName()
+    bone_names = skeleton_bone_names(names, records)
+    try:
+        network, clips = anim_DOT.load_network_clips(
+            input_name, bone_names, log=lambda msg: print("DOT: " + msg))
+    except Exception as exc:
+        print("DOT: no se pudieron leer las animaciones de RuntimeNetwork (%s)"
+              % exc)
+        return []
+    if network is None:
+        print("DOT: no hay red de animacion para %s en Media/RuntimeNetwork"
+              % anim_DOT.model_stem(input_name or ""))
+        return []
+    if not clips:
+        print("DOT: la red de animacion no trae clips que se puedan leer")
+        return []
+
+    rest = rest_locals(records, skeleton_locals(data, roots), hooks)
+    in_place = want_in_place()
+    plans = {}
+    usable = []
+    for loaded in clips:
+        key = (loaded.rig.asset_id, loaded.mapping.asset_id)
+        plan = plans.get(key)
+        if plan is None:
+            plan = plan_network_bones(loaded.rig, loaded.mapping, bone_names, records)
+            plans[key] = plan
+        if plan.chan_of:
+            usable.append((loaded, plan, is_additive(loaded.clip, plan, rest)))
+
+    absolutes = [loaded for loaded, _plan, additive in usable if not additive]
+    plan_of = dict((id(loaded), plan) for loaded, plan, _additive in usable)
+    bases = {}
+    anims = []
+    notes = []
+    for loaded, plan, additive in usable:
+        base = None
+        note = ""
+        if additive:
+            source = pick_additive_base(loaded.name, absolutes)
+            if source is not None:
+                if id(source) not in bases:
+                    bases[id(source)] = network_pose(
+                        source, plan_of[id(source)], rest, hooks, 0)
+                base = bases[id(source)]
+                note = "  aditiva sobre %s" % source.name
+            else:
+                base = rest
+                note = "  aditiva sobre la pose de reparto"
+        anims.append(build_network_anim(loaded, plan, rest, hooks, bones,
+                                        in_place, base))
+        if not in_place and anim_DOT.trajectory_moves(loaded.clip):
+            note = "  (con desplazamiento)" + note
+        notes.append(note)
+
+    print("DOT: %d animacion(es) de %s" % (len(anims), network.path))
+    for plan in plans.values():
+        print("DOT:   %d canal(es) casan con huesos del modelo"
+              % len(plan.chan_of))
+        if plan.missing:
+            print("DOT:   aviso — huesos del rig que no estan en el modelo: %s"
+                  % ", ".join(plan.missing))
+        if plan.mismatched:
+            print("DOT:   aviso — huesos con otro padre en el rig: %s"
+                  % ", ".join(plan.mismatched))
+    for anim, note in zip(anims, notes):
+        print("DOT:   %-48s %4d fotograma(s) a %g fps%s" % (
+            anim.name, anim.numFrames, anim.frameRate, note))
+    return anims
 
 
 def report_textures(textures, tex_list):
@@ -2144,7 +2542,7 @@ def noepyLoadModel(data, mdlList):
             load_node_animation(data, roots, mdl, node_tracks, node_bones,
                                 node_binds, node_por_hueso)
         else:
-            load_animation(data, roots, mdl, skeleton, joint_names, bones)
+            load_animation(data, roots, mdl, skeleton, joint_names, bones, con_peso)
 
     mdlList.append(mdl)
     print("DOT: OK — UV: tecla U")
